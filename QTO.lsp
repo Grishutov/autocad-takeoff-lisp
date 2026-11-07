@@ -1,0 +1,417 @@
+;;; =====================================================================
+;;;  QTO.lsp  -  lengths and areas of selected objects
+;;;  AutoCAD 2021-2026 (LISPSYS 0, 1 or 2)
+;;;  Sergei Grishutov, 2026 - written with AI assistance, MIT license
+;;;
+;;;  Commands
+;;;    QTO     select objects (or pre-select them) -> report by layer,
+;;;            then options:
+;;;              Labels - write L= / A= next to every object (layer QTO_LABELS)
+;;;              Excel  - copy the summary or the object list to the clipboard
+;;;                       (Ctrl+V in Excel)
+;;;              Csv    - save every object + summary to a CSV file
+;;;              Table  - insert an AutoCAD table with the summary by layer
+;;;    QTOSET  drawing units (MM / CM / M), decimals, label text height
+;;;
+;;;  Objects : LINE, ARC, CIRCLE, ELLIPSE, SPLINE, LWPOLYLINE,
+;;;            POLYLINE (2D / 3D), HATCH, REGION
+;;;  Length  : full length; for closed objects = perimeter; REGION = perimeter;
+;;;            HATCH has no length.
+;;;  Area    : closed objects only (closed flag OR start point = end point),
+;;;            HATCH and REGION. Open objects have no area.
+;;;  Results are in m and m2 (drawing units from QTOSET, default mm).
+;;;  Everything QTO adds (labels, table) is undone with one U.
+;;; =====================================================================
+(vl-load-com)
+
+;;; ---------------------------------------------------------- settings
+(defun qto:get (key def / v)
+  (if (and (setq v (getenv (strcat "QTO_" key))) (/= v "")) v def)
+)
+(defun qto:put (key val) (setenv (strcat "QTO_" key) val))
+(defun qto:units () (qto:get "Units" "mm"))
+(defun qto:k (/ u)
+  (setq u (qto:units))
+  (cond ((= u "cm") 0.01) ((= u "m") 1.0) (T 0.001))
+)
+(defun qto:dec () (max 0 (min 6 (atoi (qto:get "Dec" "2")))))
+(defun qto:txth (/ v)
+  (if (setq v (qto:get "TxtH" nil)) (atof v) (/ (getvar "VIEWSIZE") 60.0))
+)
+
+;;; ---------------------------------------------------------- helpers
+(defun qto:try (f args / r)
+  (if (vl-catch-all-error-p (setq r (vl-catch-all-apply f args))) nil r)
+)
+(defun qto:rep (c n / s) (setq s "") (repeat n (setq s (strcat s c))) s)
+(defun qto:pad (s n) (while (< (strlen s) n) (setq s (strcat s " "))) s)
+(defun qto:lpad (s n) (while (< (strlen s) n) (setq s (strcat " " s))) s)
+(defun qto:cut (s n) (if (> (strlen s) n) (strcat (substr s 1 (1- n)) "~") s))
+(defun qto:row (lst sep / s)
+  (setq s (car lst))
+  (foreach x (cdr lst) (setq s (strcat s sep x)))
+  s
+)
+;; accumulate (key count length area) in an association list
+(defun qto:acc (lst key len area / it)
+  (setq len (if len len 0.0) area (if area area 0.0))
+  (if (setq it (assoc key lst))
+    (subst (list key (1+ (cadr it)) (+ (caddr it) len) (+ (cadddr it) area)) it lst)
+    (append lst (list (list key 1 len area)))
+  )
+)
+;; Windows list separator and decimal symbol (so Excel opens the CSV correctly)
+(defun qto:intl (/ key ls ds)
+  (setq key "HKEY_CURRENT_USER\\Control Panel\\International"
+        ls  (vl-registry-read key "sList")
+        ds  (vl-registry-read key "sDecimal")
+  )
+  (if (not (and ls (/= ls ""))) (setq ls ";"))
+  (if (not (and ds (/= ds ""))) (setq ds "."))
+  (if (= ls ds) (setq ls ";"))
+  (list ls ds)
+)
+(defun qto:num (x d ds / s)
+  (if x
+    (progn (setq s (rtos x 2 d)) (if (/= ds ".") (vl-string-subst ds "." s) s))
+    ""
+  )
+)
+(defun qto:mklayer (nm col)
+  (if (not (tblsearch "LAYER" nm))
+    (entmake (list '(0 . "LAYER") '(100 . "AcDbSymbolTableRecord") '(100 . "AcDbLayerTableRecord")
+                   (cons 2 nm) '(70 . 0) (cons 62 col) '(6 . "Continuous")))
+  )
+)
+(defun qto:bbcen (obj / mn mx)
+  (vla-GetBoundingBox obj 'mn 'mx)
+  (setq mn (vlax-safearray->list mn) mx (vlax-safearray->list mx))
+  (mapcar (function (lambda (a b) (/ (+ a b) 2.0))) mn mx)
+)
+(defun qto:curvelen (e)
+  (vlax-curve-getDistAtParam e (vlax-curve-getEndParam e))
+)
+(defun qto:setclip (str / html)
+  (setq html (vlax-create-object "htmlfile"))
+  (vlax-invoke (vlax-get (vlax-get html 'parentWindow) 'clipboardData) 'setData "Text" str)
+  (vlax-release-object html)
+  T
+)
+
+;;; ---------------------------------------------------------- error / undo
+(defun qto:begin ()
+  (setq qto:doc    (vla-get-ActiveDocument (vlax-get-acad-object))
+        qto:olderr *error*
+        *error*    qto:err
+        qto:dimzin (getvar "DIMZIN")
+  )
+  (setvar "DIMZIN" 0)
+  (vla-StartUndoMark qto:doc)
+  (setq qto:undo T)
+)
+(defun qto:end ()
+  (if qto:dimzin (setvar "DIMZIN" qto:dimzin))
+  (if qto:undo (vla-EndUndoMark qto:doc))
+  (setq qto:undo nil qto:dimzin nil *error* qto:olderr)
+)
+(defun qto:err (msg)
+  (if (and msg (not (wcmatch (strcase msg) "*CANCEL*,*QUIT*,*BREAK*,*EXIT*")))
+    (princ (strcat "\nQTO error: " msg))
+  )
+  (qto:end)
+  (princ)
+)
+
+;;; ---------------------------------------------------------- measuring
+;; returns (type layer length area closed handle ename), length in m, area in m2;
+;; nil for polyface / polygon meshes
+(defun qto:measure (e k / ed typ obj len area cl sp ep)
+  (setq ed  (entget e)
+        typ (cdr (assoc 0 ed))
+        obj (vlax-ename->vla-object e)
+  )
+  (cond
+    ((and (= typ "POLYLINE") (/= 0 (logand 80 (cdr (assoc 70 ed))))) nil)
+    ((= typ "HATCH")
+     (setq area (qto:try 'vla-get-Area (list obj)))
+     (list typ (cdr (assoc 8 ed)) nil (if area (* area k k)) T (cdr (assoc 5 ed)) e)
+    )
+    ((= typ "REGION")
+     (setq area (qto:try 'vla-get-Area (list obj))
+           len  (qto:try 'vla-get-Perimeter (list obj))
+     )
+     (list typ (cdr (assoc 8 ed)) (if len (* len k)) (if area (* area k k)) T (cdr (assoc 5 ed)) e)
+    )
+    (T
+     (setq len (qto:try 'qto:curvelen (list e)))
+     (setq cl (and len
+                   (not (member typ '("LINE" "ARC")))
+                   (or (vlax-curve-isClosed e)
+                       (and (> len 1e-9)
+                            (setq sp (vlax-curve-getStartPoint e)
+                                  ep (vlax-curve-getEndPoint e)
+                            )
+                            (< (distance sp ep) 1e-4)
+                       )
+                   )
+              )
+     )
+     (if cl (setq area (qto:try 'vlax-curve-getArea (list e))))
+     (list typ (cdr (assoc 8 ed)) (if len (* len k)) (if area (* area k k)) (if cl T nil) (cdr (assoc 5 ed)) e)
+    )
+  )
+)
+;; summary by layer: ((layer count length area) ...) sorted by layer name
+(defun qto:sum (data / lay)
+  (foreach r data (setq lay (qto:acc lay (cadr r) (caddr r) (cadddr r))))
+  (vl-sort lay (function (lambda (a b) (< (strcase (car a)) (strcase (car b))))))
+)
+(defun qto:total (lay / n l a)
+  (setq n 0 l 0.0 a 0.0)
+  (foreach x lay (setq n (+ n (cadr x)) l (+ l (caddr x)) a (+ a (cadddr x))))
+  (list "TOTAL" n l a)
+)
+
+;;; ---------------------------------------------------------- report
+(defun qto:report (data nskip / lay tot d w s bytype na nl fl)
+  (setq lay (qto:sum data) tot (qto:total lay) d (qto:dec) w 20 na 0 nl 0)
+  (foreach x lay (setq w (max w (+ 2 (strlen (car x))))))
+  (setq w (min w 40))
+  (defun fl (x)
+    (strcat "\n" (qto:pad (qto:cut (car x) (1- w)) w)
+            (qto:lpad (itoa (cadr x)) 6)
+            (qto:lpad (rtos (caddr x) 2 d) 14)
+            (qto:lpad (rtos (cadddr x) 2 d) 14)
+    )
+  )
+  (princ (strcat "\n" (qto:rep "=" (+ w 34))))
+  (princ (strcat "\n" (qto:pad "Layer" w) (qto:lpad "Qty" 6) (qto:lpad "Length, m" 14) (qto:lpad "Area, m2" 14)))
+  (princ (strcat "\n" (qto:rep "-" (+ w 34))))
+  (foreach x lay (princ (fl x)))
+  (princ (strcat "\n" (qto:rep "-" (+ w 34))))
+  (princ (fl tot))
+  (foreach r data
+    (setq bytype (qto:acc bytype (car r) nil nil))
+    (if (cadddr r) (setq na (1+ na)))
+    (if (caddr r) (setq nl (1+ nl)))
+  )
+  (setq s "\nObjects: ")
+  (foreach x bytype (setq s (strcat s (car x) " " (itoa (cadr x)) "   ")))
+  (princ s)
+  (princ (strcat "\nWith length: " (itoa nl) "   with area (closed / hatch / region): " (itoa na)
+                 (if (> nskip 0) (strcat "   skipped (meshes): " (itoa nskip)) "")))
+  (princ (strcat "\nTOTAL: " (itoa (cadr tot)) " objects   L = " (rtos (caddr tot) 2 d)
+                 " m   A = " (rtos (cadddr tot) 2 d) " m2   (drawing units: " (qto:units) ")"))
+  (princ "\n(F2 opens the full report)")
+)
+
+;;; ---------------------------------------------------------- labels
+(defun qto:labels (data / mode h h2 d n e txt ang p der len)
+  (initget "Length Area Both")
+  (setq mode (cond ((getkword "\nLabel [Length/Area/Both] <Both>: ")) ("Both")))
+  (setq h (qto:txth))
+  (initget 6)
+  (if (setq h2 (getdist (strcat "\nText height <" (rtos h 2 2) ">: "))) (setq h h2))
+  (qto:put "TxtH" (rtos h 2 4))
+  (qto:mklayer "QTO_LABELS" 1)
+  (setq d (qto:dec) n 0)
+  (foreach r data
+    (setq e (last r) txt nil ang 0.0 p nil)
+    (if (and (caddr r) (/= mode "Area"))
+      (setq txt (strcat "L=" (rtos (caddr r) 2 d) " m"))
+    )
+    (if (and (cadddr r) (/= mode "Length"))
+      (setq txt (strcat (if txt (strcat txt "\\P") "") "A=" (rtos (cadddr r) 2 d) " m\\U+00B2"))
+    )
+    (if txt
+      (progn
+        (if (nth 4 r)
+          ;; closed object / hatch / region: centre of the bounding box
+          (setq p (qto:try 'qto:bbcen (list (vlax-ename->vla-object e))))
+          ;; open curve: middle of its length, text along the curve, a bit above it
+          (progn
+            (if (setq len (qto:try 'qto:curvelen (list e)))
+              (setq p (qto:try 'vlax-curve-getPointAtDist (list e (/ len 2.0))))
+            )
+            (if p
+              (progn
+                (setq der (qto:try (function (lambda (x pt) (vlax-curve-getFirstDeriv x (vlax-curve-getParamAtPoint x pt))))
+                                   (list e p)))
+                (if der (setq ang (angle '(0.0 0.0) (list (car der) (cadr der)))))
+                (if (and (> ang (* 0.5 pi)) (<= ang (* 1.5 pi))) (setq ang (- ang pi)))
+                (setq p (polar p (+ ang (* 0.5 pi)) (* 0.8 h)))
+              )
+            )
+          )
+        )
+        (if p
+          (progn
+            (entmake (list '(0 . "MTEXT") '(100 . "AcDbEntity") '(8 . "QTO_LABELS") '(100 . "AcDbMText")
+                           (cons 10 p) (cons 40 h) '(71 . 5) (cons 7 (getvar "TEXTSTYLE")) (cons 50 ang) (cons 1 txt)))
+            (setq n (1+ n))
+          )
+        )
+      )
+    )
+  )
+  (princ (strcat "\n" (itoa n) " labels on layer QTO_LABELS (U removes them)."))
+)
+
+;;; ---------------------------------------------------------- clipboard (Excel)
+(defun qto:toclip (data / what lay tot d ds s i)
+  (initget "Summary Objects")
+  (setq what (cond ((getkword "\nCopy [Summary/Objects] <Summary>: ")) ("Summary")))
+  (setq d (qto:dec) ds (cadr (qto:intl)))
+  (if (= what "Objects")
+    (progn
+      (setq s "No\tType\tLayer\tLength, m\tArea, m2\tHandle" i 0)
+      (foreach r data
+        (setq i (1+ i)
+              s (strcat s "\r\n" (itoa i) "\t" (car r) "\t" (cadr r) "\t" (qto:num (caddr r) d ds)
+                        "\t" (qto:num (cadddr r) d ds) "\t" (nth 5 r))
+        )
+      )
+    )
+    (progn
+      (setq lay (qto:sum data) tot (qto:total lay) s "Layer\tQty\tLength, m\tArea, m2")
+      (foreach x (append lay (list tot))
+        (setq s (strcat s "\r\n" (car x) "\t" (itoa (cadr x)) "\t" (qto:num (caddr x) d ds) "\t" (qto:num (cadddr x) d ds)))
+      )
+    )
+  )
+  (if (qto:try 'qto:setclip (list s))
+    (princ "\nCopied - paste into Excel with Ctrl+V.")
+    (princ "\nNo access to the clipboard - use the Csv option.")
+  )
+)
+
+;;; ---------------------------------------------------------- CSV
+(defun qto:csv (data / fn f intl ls ds d i lay tot q)
+  (setq fn (getfiled "Save lengths and areas (CSV)"
+                     (strcat (getvar "DWGPREFIX") (vl-filename-base (getvar "DWGNAME")) "_QTO.csv")
+                     "csv" 1))
+  (if fn
+    (progn
+      (setq f (qto:try 'open (list fn "w" "utf8-bom")))   ; UTF-8 for Greek / Cyrillic layer names
+      (if (null f) (setq f (open fn "w")))                ; LISPSYS 0
+      (if (null f)
+        (princ "\nCannot write the file - is it open in Excel?")
+        (progn
+          (setq intl (qto:intl) ls (car intl) ds (cadr intl) d (max 3 (qto:dec)) q "\"" i 0)
+          (write-line (qto:row (list "No" "Type" "Layer" "Length, m" "Area, m2" "Closed" "Handle") ls) f)
+          (foreach r data
+            (setq i (1+ i))
+            (write-line (qto:row (list (itoa i) (car r) (strcat q (cadr r) q) (qto:num (caddr r) d ds)
+                                       (qto:num (cadddr r) d ds) (if (nth 4 r) "yes" "no")
+                                       (strcat "=" q (nth 5 r) q))
+                                 ls) f)
+          )
+          (write-line "" f)
+          (write-line (qto:row (list "" "By layer" "Layer" "Length, m" "Area, m2" "Qty") ls) f)
+          (setq lay (qto:sum data) tot (qto:total lay))
+          (foreach x (append lay (list tot))
+            (write-line (qto:row (list "" "" (strcat q (car x) q) (qto:num (caddr x) d ds) (qto:num (cadddr x) d ds) (itoa (cadr x))) ls) f)
+          )
+          (write-line "" f)
+          (write-line (qto:row (list "" "Drawing" (strcat q (getvar "DWGPREFIX") (getvar "DWGNAME") q)) ls) f)
+          (write-line (qto:row (list "" "Drawing units" (qto:units)) ls) f)
+          (close f)
+          (princ (strcat "\nSaved: " fn))
+        )
+      )
+    )
+  )
+)
+
+;;; ---------------------------------------------------------- table
+(defun qto:table (data / lay tot d h pt doc sp tbl nr r c x)
+  (setq lay (qto:sum data) tot (qto:total lay) d (qto:dec) h (qto:txth))
+  (if (setq pt (getpoint "\nTable insertion point (top left): "))
+    (progn
+      (setq doc (vla-get-ActiveDocument (vlax-get-acad-object))
+            sp  (if (= (getvar "CVPORT") 1) (vla-get-PaperSpace doc) (vla-get-ModelSpace doc))
+            nr  (+ 3 (length lay))
+            tbl (vla-AddTable sp (vlax-3d-point (trans pt 1 0)) nr 4 (* 2.0 h) (* 9.0 h))
+      )
+      (vla-put-RegenerateTableSuppressed tbl :vlax-true)
+      (qto:try 'vla-SetTextHeight (list tbl 7 h))
+      (vla-SetColumnWidth tbl 0 (* 16.0 h))
+      (vla-SetColumnWidth tbl 1 (* 5.0 h))
+      (vla-SetText tbl 0 0 (strcat "Lengths and areas - " (vl-filename-base (getvar "DWGNAME"))))
+      (setq c 0)
+      (foreach x '("Layer" "Qty" "Length, m" "Area, m2") (vla-SetText tbl 1 c x) (setq c (1+ c)))
+      (setq r 2)
+      (foreach x (append lay (list tot))
+        (vla-SetText tbl r 0 (car x))
+        (vla-SetText tbl r 1 (itoa (cadr x)))
+        (vla-SetText tbl r 2 (rtos (caddr x) 2 d))
+        (vla-SetText tbl r 3 (rtos (cadddr x) 2 d))
+        (foreach c '(1 2 3) (qto:try 'vla-SetCellAlignment (list tbl r c 6)))   ; middle right
+        (setq r (1+ r))
+      )
+      (vla-put-RegenerateTableSuppressed tbl :vlax-false)
+      (princ "\nTable inserted.")
+    )
+  )
+)
+
+;;; ---------------------------------------------------------- commands
+(defun c:QTO (/ flt ss i e r data k nskip kw)
+  (qto:begin)
+  (setq k   (qto:k)
+        flt '((0 . "LINE,ARC,CIRCLE,ELLIPSE,SPLINE,LWPOLYLINE,POLYLINE,HATCH,REGION"))
+  )
+  (princ (strcat "\nQTO - lengths and areas. Drawing units: " (qto:units) " (QTOSET to change)."))
+  (setq ss (cond ((ssget "_I" flt)) ((ssget flt))))
+  (sssetfirst nil nil)
+  (if (null ss)
+    (princ "\nNothing selected.")
+    (progn
+      (setq i 0 nskip 0)
+      (repeat (sslength ss)
+        (setq e (ssname ss i) i (1+ i))
+        (if (setq r (qto:measure e k)) (setq data (cons r data)) (setq nskip (1+ nskip)))
+      )
+      (setq data (reverse data))
+      (if (null data)
+        (princ "\nNo measurable objects.")
+        (progn
+          (qto:report data nskip)
+          (while (progn
+                   (initget "Labels Excel Csv Table eXit")
+                   (setq kw (getkword "\nOption [Labels/Excel/Csv/Table/eXit] <eXit>: "))
+                   (and kw (/= kw "eXit"))
+                 )
+            (cond ((= kw "Labels") (qto:labels data))
+                  ((= kw "Excel") (qto:toclip data))
+                  ((= kw "Csv") (qto:csv data))
+                  ((= kw "Table") (qto:table data))
+            )
+          )
+        )
+      )
+    )
+  )
+  (qto:end)
+  (princ)
+)
+
+(defun c:QTOSET (/ u d h)
+  (initget "MM CM M")
+  (if (setq u (getkword (strcat "\nDrawing units [MM/CM/M] <" (strcase (qto:units)) ">: ")))
+    (qto:put "Units" (strcase u T))
+  )
+  (initget 4)
+  (if (setq d (getint (strcat "\nDecimals <" (itoa (qto:dec)) ">: ")))
+    (qto:put "Dec" (itoa (min 6 d)))
+  )
+  (initget 6)
+  (if (setq h (getdist (strcat "\nLabel / table text height in drawing units <" (rtos (qto:txth) 2 2) ">: ")))
+    (qto:put "TxtH" (rtos h 2 4))
+  )
+  (princ (strcat "\nQTO: units " (qto:units) ", decimals " (itoa (qto:dec)) ", text height " (rtos (qto:txth) 2 2)))
+  (princ)
+)
+
+(princ "\nQTO loaded: QTO - lengths and areas, QTOSET - units / decimals / text height.")
+(princ)
